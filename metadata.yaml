@@ -1,4 +1,4 @@
-name: forward_reader
+name: astrbot_plugin_forward_reader
 desc: 一个使用 LLM 分析合并转发消息内容的插件。
 version: 1.0.8
 author: EraAsh
@@ -7,3 +7,4 @@ tags: ["工具", "LLM", "消息处理"]
 license: "AGPL-3.0"
 python_version: ">=3.8"
 astrbot_version: ">=3.4.0"
+
