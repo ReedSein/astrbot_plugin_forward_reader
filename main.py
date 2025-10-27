@@ -73,7 +73,7 @@ class ForwardReader(Star):
         if forward_id and user_query:
             try:
                 # 发送一个等待消息，改善用户体验
-                await event.send(event.chain_result([Comp.Reply(id=event.message_obj.message_id), Comp.Plain("正在分析聊天记录，请稍候...")]))
+                await event.send(event.chain_result([Comp.Reply(id=event.message_obj.message_id), Comp.Plain("嗯…让我看看这是什么有趣的分享...")]))
 
                 # 1. 提取合并转发内容
                 extracted_texts, image_urls = await self._extract_forward_content(event, forward_id)
@@ -170,3 +170,4 @@ class ForwardReader(Star):
 
     async def terminate(self):
         pass
+
