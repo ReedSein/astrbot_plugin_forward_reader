@@ -86,8 +86,8 @@ class ForwardReader(Star):
 
                 # 2. [核心修改] 构建全新的罗莎人格 Prompt
                 chat_records = "\n".join(extracted_texts)
-                user_id = event.sender.id
-                nickname = event.sender.name
+                user_id = event.get_sender_id()
+                nickname = event.get_sender_name()
 
                 final_prompt = f"""[罗莎的感官输入]: 一叠被捕获的、属于不同标本的言语切片，如同被压制在玻璃下的昆虫标本一样，被呈现在我的屏幕上。一个声音——源自一个我尚不关心的频率——附上了一句乏味的题词：“{user_query}”。
 
@@ -268,3 +268,4 @@ class ForwardReader(Star):
     async def terminate(self):
 
         pass
+
