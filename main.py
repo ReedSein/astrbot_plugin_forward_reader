@@ -5,6 +5,7 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
+from .favour_manager import FavourCommand # 导入新创建的命令类
 
 # 检查是否为 aiocqhttp 平台，因为合并转发是其特性
 try:
@@ -15,6 +16,62 @@ except ImportError:
 
 
 @register("forward_reader", "EraAsh", "一个使用 LLM 分析合并转发消息内容的插件", "1.1.1", "https://github.com/EraAsh/astrbot_plugin_forward_reader")
+class ForwardReader(Star):
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        self._load_config()
+
+# --------------------------------------------------------------------------------
+# 注册 FavourCommand 类，使其与 ForwardReader 一起生效
+# --------------------------------------------------------------------------------
+@register("favour_command", "EraAsh", "好感度命令扩展", "1.0.0", "https://github.com/EraAsh/astrbot_plugin_forward_reader")
+class FavourCommand(Star):
+    """
+    处理好感度相关命令的插件。
+    """
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.favour_manager = FavourManager(context)
+        self.config = config
+        self.admin_qq = self.config.get("admin_qq", None) # 假设配置中可以获取管理员QQ
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.command("/重置负面")
+    async def reset_negative_favour_command(self, event: AstrMessageEvent, *args, **kwargs):
+        """
+        处理 /重置负面 命令，重置所有用户的负面好感度。
+        """
+        # 1. 权限检查：确保只有管理员可以执行此命令
+        sender_id = str(event.sender.id)
+        if self.admin_qq and sender_id != str(self.admin_qq):
+            logger.warning(f"非管理员用户 {sender_id} 尝试执行 /重置负面 命令。")
+            yield event.plain_result("权限不足，只有管理员可以执行此命令。")
+            return
+
+        # 2. 执行重置操作
+        reset_count = self.favour_manager.reset_negative_favour()
+
+        # 3. 构造回复消息
+        if reset_count > 0:
+            reply_text = f"成功重置了 {reset_count} 个用户的负面好感度，他们的好感度已设置为 0。"
+        else:
+            reply_text = "没有发现负面好感度的用户，无需重置。"
+
+        logger.info(f"管理员 {sender_id} 执行 /重置负面 命令，结果: {reply_text}")
+        
+        # 4. 发送回复
+        yield event.plain_result(reply_text)
+        event.stop_event()
+
+    async def terminate(self):
+        pass
+
+# --------------------------------------------------------------------------------
+# 为了让插件生效，我们需要在 main.py 中导入并注册 FavourCommand 类。
+# 但是为了不破坏原有的 forward_reader 逻辑，我们直接在 main.py 中添加 FavourCommand 的注册。
+# --------------------------------------------------------------------------------
+
 class ForwardReader(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
