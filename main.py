@@ -1,4 +1,5 @@
 import json
+import asyncio  # 需要导入 asyncio 用于 sleep
 from typing import List, Dict, Any, Optional
 
 from astrbot.api import logger, AstrBotConfig
@@ -14,7 +15,7 @@ except ImportError:
     IS_AIOCQHTTP = False
 
 
-@register("forward_reader", "EraAsh", "一个使用 LLM 分析合并转发消息内容的插件", "1.4.1", "https://github.com/EraAsh/astrbot_plugin_forward_reader")
+@register("forward_reader", "EraAsh", "一个使用 LLM 分析合并转发消息内容的插件", "1.5.0", "https://github.com/EraAsh/astrbot_plugin_forward_reader")
 class ForwardReader(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -26,8 +27,13 @@ class ForwardReader(Star):
         self.enable_direct_analysis = self.config.get("enable_direct_analysis", False)
         self.enable_reply_analysis = self.config.get("enable_reply_analysis", True)
         self.waiting_message = self.config.get("waiting_message", "嗯…让我看看你这个小家伙发了什么有趣的东西。")
-        # 仅保留文本长度软限制，防止 Context Window 溢出导致 API 报错
         self.max_text_length = 15000 
+        
+        # --- 重试配置 ---
+        retry_cfg = self.config.get("retry_config", {})
+        self.max_retries = retry_cfg.get("max_retries", 2)
+        self.retry_interval = retry_cfg.get("retry_interval", 2)
+        self.fallback_reply = retry_cfg.get("fallback_reply", "（罗莎似乎陷入了沉思，无法组织起有效的语言……）")
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_any_message(self, event: AstrMessageEvent, *args, **kwargs):
@@ -64,49 +70,37 @@ class ForwardReader(Star):
                 logger.warning(f"ForwardReader: 获取被回复消息详情失败: {e}")
 
         if forward_id and user_query:
-            event.stop_event() # 截断事件
+            event.stop_event()
             
             try:
                 yield event.chain_result([Comp.Reply(id=event.message_obj.message_id), Comp.Plain(self.waiting_message)])
 
-                # 提取内容 (不再限制图片数量)
                 extracted_texts, image_urls = await self._extract_forward_content(event, forward_id)
                 
                 if not extracted_texts and not image_urls:
                     yield event.plain_result("无法从合并转发消息中提取到任何有效内容。")
                     return
 
-                # 注入数据构建
+                # 构建数据
                 chat_records_str = "\n".join(extracted_texts)
-                
-                # 文本过长截断 (这个建议保留，防止几万字的小说直接把 LLM 撑爆)
                 if len(chat_records_str) > self.max_text_length:
                     chat_records_str = chat_records_str[:self.max_text_length] + "\n\n[...系统提示：由于篇幅过长，后续内容已被截断...]"
-
                 chat_records_injection = f"<chat_log>\n{chat_records_str}\n</chat_log>"
 
                 sender_name = event.get_sender_name() or "未知访客"
                 sender_id = event.get_sender_id() or "unknown"
 
-                # 加载 Prompt
+                # 获取 Prompt
                 prompt_template = self.config.get("analysis_prompt", "")
                 if not prompt_template:
-                    prompt_template = """[罗莎的感官输入]: 磷光屏上，一段文本被呈现。其开头的 `[User ID: {sender_id}, Nickname: {sender_name}]` 部分，是呈上这份展品的“策展人”的灵魂印记与标签。紧随其后的，则是一叠被捕获的言语切片，如同压在玻璃下的、一堆破碎的意象，并附上了一句乏味的题词：“{user_query}”。
-
-以下是这份展品的全部内容，已被封装在 <chat_log> 标签中，请注意其中的 [图片x] 标签对应上传的第 x 张图片：
-
-{chat_records}
-
-罗莎，现在，审视着眼前的这份呈报...
-"""
+                    prompt_template = """[罗莎的感官输入]: ... (默认Prompt) ... <罗莎内心OS> ..."""
                 
-                final_prompt = prompt_template.replace("{sender_name}", str(sender_name)) \
-                                              .replace("{sender_id}", str(sender_id)) \
-                                              .replace("{user_query}", str(user_query)) \
-                                              .replace("{chat_records}", chat_records_injection)
+                base_prompt = prompt_template.replace("{sender_name}", str(sender_name)) \
+                                             .replace("{sender_id}", str(sender_id)) \
+                                             .replace("{user_query}", str(user_query)) \
+                                             .replace("{chat_records}", chat_records_injection)
 
-                logger.info(f"ForwardReader: 请求分析, 文本长度: {len(chat_records_str)}, 图片数: {len(image_urls)}")
-
+                # 获取 Provider
                 umo = event.unified_msg_origin
                 provider_id = await self.context.get_current_chat_provider_id(umo=umo)
                 provider = self.context.get_provider_by_id(provider_id) or self.context.get_using_provider()
@@ -115,14 +109,60 @@ class ForwardReader(Star):
                     yield event.plain_result("错误：未找到可用的 LLM Provider。")
                     return
 
-                llm_response = await provider.text_chat(
-                    prompt=final_prompt,
-                    image_urls=image_urls, 
-                    contexts=[],
-                    func_tool=None
-                )
+                # ==================== [核心修改：带格式强调的重试循环] ====================
+                current_prompt = base_prompt
+                final_response_text = ""
                 
-                yield event.plain_result(llm_response.completion_text)
+                for attempt in range(self.max_retries + 1):
+                    logger.info(f"ForwardReader: 发起请求 (Attempt {attempt + 1}/{self.max_retries + 1})")
+                    
+                    try:
+                        llm_response = await provider.text_chat(
+                            prompt=current_prompt,
+                            image_urls=image_urls, 
+                            contexts=[],
+                            func_tool=None
+                        )
+                        text = llm_response.completion_text
+                        
+                        # --- 验证逻辑 ---
+                        # 1. 判空
+                        if not text or not text.strip():
+                            logger.warning(f"ForwardReader: 第 {attempt + 1} 次尝试返回空内容。")
+                            raise ValueError("Empty response")
+                        
+                        # 2. 格式检查 (可选: 如果是罗莎风格，检查 <罗莎内心OS>)
+                        # 这里做一个宽松检查：如果 prompt 里有 <罗莎内心OS>，那么返回里也应该有
+                        if "<罗莎内心OS>" in base_prompt and "<罗莎内心OS>" not in text:
+                            logger.warning(f"ForwardReader: 第 {attempt + 1} 次尝试格式错误 (丢失 CoT 标签)。")
+                            raise ValueError("Missing CoT tags")
+
+                        # 成功！
+                        final_response_text = text
+                        break
+
+                    except Exception as e:
+                        if attempt < self.max_retries:
+                            logger.info(f"ForwardReader: 准备重试，等待 {self.retry_interval} 秒...")
+                            await asyncio.sleep(self.retry_interval)
+                            
+                            # --- 格式强调 (Format Emphasis) ---
+                            # 在下一次请求的 Prompt 后追加系统警告
+                            warning_msg = "\n\n[系统警告]: 也就是你的上一次回复，出现了【内容为空】或【格式丢失】的严重错误。请立刻修正！\n" \
+                                          "1. 必须输出内容。\n" \
+                                          "2. 必须严格遵守 <罗莎内心OS>...思考内容...</罗莎内心OS> 的 XML 结构。\n" \
+                                          "3. 不要输出任何反思过程，直接输出正确的最终结果。"
+                            current_prompt = base_prompt + warning_msg
+                        else:
+                            logger.error("ForwardReader: 所有重试均失败。")
+                
+                # ======================================================================
+
+                if final_response_text:
+                    yield event.plain_result(final_response_text)
+                else:
+                    # 兜底回复
+                    yield event.plain_result(self.fallback_reply)
                 
             except Exception as e:
                 logger.error(f"ForwardReader: 分析失败: {e}")
@@ -130,7 +170,7 @@ class ForwardReader(Star):
 
     async def _extract_forward_content(self, event: AiocqhttpMessageEvent, forward_id: str) -> tuple[list[str], list[str]]:
         """
-        提取逻辑：保留图片索引编号，移除数量上限
+        提取逻辑：保留图片索引编号
         """
         client = event.bot
         try:
@@ -143,7 +183,6 @@ class ForwardReader(Star):
 
         extracted_texts = []
         image_urls = []
-        
         img_count = 0
 
         for message_node in forward_data["messages"]:
@@ -174,7 +213,6 @@ class ForwardReader(Star):
                             if url:
                                 img_count += 1
                                 image_urls.append(url)
-                                # 核心保留：索引编号，帮助 LLM 定位图片位置
                                 node_text_parts.append(f"[图片{img_count}]")
             
             full_node_text = "".join(node_text_parts).strip()
